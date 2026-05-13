@@ -212,6 +212,19 @@ Stato runtime. Campi chiave:
 
 ---
 
+## Regola obbligatoria: test dopo ogni modifica
+
+**Dopo ogni modifica a `pompa_piscina.js` eseguire sempre:**
+
+```bash
+cd pool-controller-server
+node test.js
+```
+
+Tutti i test devono passare prima di rigenerare il `.min.js` o fare commit. Ogni nuova feature o comportamento modificato deve essere coperto da almeno un test in `test.js`. Se si aggiunge logica non coperta dai test esistenti, aggiungere i casi corrispondenti prima di considerare la modifica completa.
+
+---
+
 ## Istruzioni per modifiche future
 
 ### Aggiungere una nuova fascia oraria

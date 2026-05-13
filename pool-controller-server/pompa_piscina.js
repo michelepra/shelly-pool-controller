@@ -51,6 +51,7 @@ let CONFIG = {
   textID: 200,                    // ID Virtual Component temperatura acqua
   currentMeteoID: 201,            // ID Virtual Component condizioni meteo attuali
   forecastID: 202,                // ID Virtual Component previsioni giorno successivo
+  scheduleID: 203,                // ID Virtual Component modalita' fascia oraria e ore pompa
   switchID: 0,                    // ID rele' pompa
   antifreezeTempC: 3,             // soglia antigelo
   antifreezeDuration: 300000,     // durata antigelo 5 minuti (ms)
@@ -106,6 +107,11 @@ let STATE = {
   hourBufSum: 0,              // somma corrente del buffer (aggiornamento O(1))
   readingInProgress: false,   // true durante multiReadTemp, blocca il timer
   pumpOn: false,
+  pumpOnSince: 0,             // timestamp (ms) accensione pompa; 0 se spenta
+  pumpTodayMs: 0,             // ms totali di funzionamento pompa oggi (sessioni completate)
+  energyStartWh: 0,           // Wh letti dal PM a inizio giornata (base per calcolo delta)
+  manualOverride: null,       // "on"/"off" = override manuale in AUTO; null = nessun override
+  overridePhase: 0,           // 0 = in attesa che lo schedule cambi, 1 = ha cambiato, aspetto il ritorno
   antifreezeActive: false,
   antifreezeTimer: null,
   ready: false,
@@ -221,6 +227,42 @@ function updateMeteoComponents() {
       if (e) print("VC text:" + CONFIG.forecastID + ": errore - " + e);
     });
   }
+}
+
+// ─── VIRTUAL COMPONENT FASCIA ORARIA ─────────────────────────────────────────
+
+let SCHEDULE_HOURS = { "A1": 1, "A3": 3, "A6": 6, "A9": 9, "A13": 13 };
+
+function updateScheduleComponent() {
+  let mode = STATE.activeScheduleMode;
+  let minH = (mode !== null && SCHEDULE_HOURS[mode] !== undefined) ? SCHEDULE_HOURS[mode] : null;
+
+  // Runtime odierno: sessioni completate + sessione in corso
+  let totalMs = STATE.pumpTodayMs;
+  if (STATE.pumpOn && STATE.pumpOnSince > 0) {
+    totalMs += Date.now() - STATE.pumpOnSince;
+  }
+  let totalMin = Math.floor(totalMs / 60000);
+  let h = Math.floor(totalMin / 60);
+  let m = totalMin % 60;
+  let mPad = m < 10 ? "0" + m : "" + m;
+
+  // Energia odierna: delta Wh dal PM integrato nel rele' 0 (lettura sincrona)
+  let kwh = "--";
+  let sw = Shelly.getComponentStatus("switch:" + CONFIG.switchID);
+  if (sw && sw.aenergy && typeof sw.aenergy.total === "number") {
+    let todayWh = sw.aenergy.total - STATE.energyStartWh;
+    if (todayWh < 0) todayWh = 0;
+    kwh = Math.round(todayWh / 100) / 10;
+  }
+
+  let val = h + "h" + mPad + "m" +
+            " | " + kwh + " Kwh" +
+            " | " + (minH !== null ? minH + "h" : "--");
+
+  Shelly.call("Text.Set", { id: CONFIG.scheduleID, value: val }, function(r, e) {
+    if (e) print("VC text:" + CONFIG.scheduleID + ": errore - " + e);
+  });
 }
 
 // ─── KV STORE ────────────────────────────────────────────────────────────────
@@ -422,13 +464,26 @@ function checkDateChange() {
   STATE.hourBufIdx      = 0;
   STATE.hourBufLen      = 0;
   STATE.hourBufSum      = 0;
+  STATE.pumpTodayMs     = 0;
+  STATE.manualOverride  = null;
+  STATE.overridePhase   = 0;
+  // Se la pompa e' accesa a cavallo della mezzanotte, azzera il riferimento
+  // cosi' l'accumulatore riparte da zero per il nuovo giorno
+  if (STATE.pumpOn) STATE.pumpOnSince = Date.now();
+  let swDay = Shelly.getComponentStatus("switch:" + CONFIG.switchID);
+  if (swDay && swDay.aenergy && swDay.aenergy.total !== undefined) {
+    STATE.energyStartWh = swDay.aenergy.total;
+  }
   STATE.todayMonth      = month;
   STATE.todayDay        = day;
   STATE.todayMaxTemp    = null;
   STATE.todayMinTemp    = null;
   STATE.todayCurrentTemp = null;
   print("Nuovo giorno " + day + "/" + mStr(month));
-  updateVirtualComponent();
+  // Non chiamare updateVirtualComponent/updateScheduleComponent qui:
+  // a mezzanotte si accodano gia' saveCalibration+saveScheduleMode+Switch.Set
+  // e il limite di Shelly.call concorrenti (5) verrebbe superato.
+  // I timer periodici (30s e 60s) aggiornano i VC entro un minuto.
 }
 
 function updateDailyStats(temp) {
@@ -449,13 +504,16 @@ function updateDailyStats(temp) {
   STATE.hourBufIdx      = (idx + 1) % maxLen;
   let hourAvg = Math.round(STATE.hourBufSum / STATE.hourBufLen * 10) / 10;
 
-  if (STATE.todayMaxTemp === null || hourAvg > STATE.todayMaxTemp) {
-    STATE.todayMaxTemp = hourAvg;
-    print("Nuovo massimo odierno: " + hourAvg);
-  }
-  if (STATE.todayMinTemp === null || hourAvg < STATE.todayMinTemp) {
-    STATE.todayMinTemp = hourAvg;
-    print("Nuovo minimo odierno: " + hourAvg);
+  let pumpRunMs = STATE.pumpOn && STATE.pumpOnSince > 0 ? Date.now() - STATE.pumpOnSince : 0;
+  if (pumpRunMs > 60000) {
+    if (STATE.todayMaxTemp === null || hourAvg > STATE.todayMaxTemp) {
+      STATE.todayMaxTemp = hourAvg;
+      print("Nuovo massimo odierno: " + hourAvg);
+    }
+    if (STATE.todayMinTemp === null || hourAvg < STATE.todayMinTemp) {
+      STATE.todayMinTemp = hourAvg;
+      print("Nuovo minimo odierno: " + hourAvg);
+    }
   }
   updateVirtualComponent();
 }
@@ -621,7 +679,13 @@ function checkAntifreeze(temp) {
 function setPump(on, source) {
   if (STATE.pumpOn === on) return;
   print("Pompa: " + (on ? "ON" : "OFF") + " [" + source + "]");
+  if (!on && STATE.pumpOnSince > 0) {
+    STATE.pumpTodayMs += Date.now() - STATE.pumpOnSince;
+  }
   STATE.pumpOn = on;
+  STATE.pumpOnSince = on ? Date.now() : 0;
+  // Non chiamare updateScheduleComponent qui: il timer da 60s lo fa gia',
+  // e durante il cambio giorno si supererebbe il limite di Shelly.call concorrenti.
   Shelly.call("Switch.Set", { id: CONFIG.switchID, on: on });
 }
 
@@ -664,6 +728,41 @@ function evaluatePump() {
 
   let dateInfo = getDateInfo(getUnixtime());
   let shouldRun = shouldPumpRunBySchedule(dateInfo.hour, temp);
+
+  if (STATE.manualOverride === "on") {
+    if (shouldRun) {
+      // Lo schedule e' entrato in una fascia ON: avanza alla fase 1
+      STATE.overridePhase = 1;
+    } else if (STATE.overridePhase === 1) {
+      // Fase 1: lo schedule e' tornato OFF dopo essere stato ON -> termina override
+      STATE.manualOverride = null;
+      STATE.overridePhase = 0;
+      print("Override ON terminato: fascia spegnimento raggiunta");
+      setPump(false, "auto T=" + temp + " H=" + dateInfo.hour);
+      return;
+    }
+    // Fase 0 con schedule OFF: override impostato fuori fascia, tieni accesa
+    setPump(true, "override ON manuale");
+    return;
+  }
+
+  if (STATE.manualOverride === "off") {
+    if (!shouldRun) {
+      // Lo schedule e' entrato in una fascia OFF: avanza alla fase 1
+      STATE.overridePhase = 1;
+    } else if (STATE.overridePhase === 1) {
+      // Fase 1: lo schedule e' tornato ON dopo essere stato OFF -> termina override
+      STATE.manualOverride = null;
+      STATE.overridePhase = 0;
+      print("Override OFF terminato: fascia accensione raggiunta");
+      setPump(true, "auto T=" + temp + " H=" + dateInfo.hour);
+      return;
+    }
+    // Fase 0 con schedule ON: override impostato dentro fascia, tieni spenta
+    setPump(false, "override OFF manuale");
+    return;
+  }
+
   setPump(shouldRun, "auto T=" + temp + " H=" + dateInfo.hour);
 }
 
@@ -691,6 +790,8 @@ Shelly.addStatusHandler(function(event) {
     let prevMode = STATE.currentMode;
     let newMode = event.delta.value;
     STATE.currentMode = newMode;
+    STATE.manualOverride = null;
+    STATE.overridePhase = 0;
     print("Modalita': " + newMode);
     if (newMode === "OFF" && prevMode === "EXTERNAL" && STATE.hwActive) {
       STATE.extForcedOff = true;
@@ -698,6 +799,29 @@ Shelly.addStatusHandler(function(event) {
       print("EXTERNAL: pompa bloccata da app, attendo nuovo impulso SW1");
     }
     evaluatePump();
+  }
+  if (event.component === "switch:" + CONFIG.switchID) {
+    if (!event.delta || event.delta.output === undefined) return;
+    let realOn = event.delta.output === true;
+    // Se il cambio e' stato originato dallo script, STATE.pumpOn e' gia' aggiornato: nessuna azione.
+    if (realOn === STATE.pumpOn) return;
+    // Cambio esterno (app Shelly, automazione): sincronizza contatori.
+    if (realOn && STATE.pumpOnSince === 0) {
+      STATE.pumpOnSince = Date.now();
+    } else if (!realOn && STATE.pumpOnSince > 0) {
+      STATE.pumpTodayMs += Date.now() - STATE.pumpOnSince;
+      STATE.pumpOnSince = 0;
+    }
+    STATE.pumpOn = realOn;
+    // In AUTO: imposta override manuale; evaluatePump lo rispettera' fino al cambio fascia.
+    if (STATE.currentMode === "AUTO") {
+      STATE.manualOverride = realOn ? "on" : "off";
+      STATE.overridePhase = 0;
+      print("Override manuale AUTO: " + (realOn ? "ON fino a prossimo spegnimento" : "OFF fino a prossimo avvio"));
+    }
+    updateScheduleComponent();
+    // SW1 attivo ha priorita' assoluta: ristabilisce immediatamente lo stato corretto.
+    if (STATE.ready && STATE.hwActive) evaluatePump();
   }
   if (event.component === "number:" + CONFIG.sondaInputID) {
     if (!event.delta || event.delta.value === undefined) return;
@@ -722,6 +846,7 @@ Timer.set(CONFIG.tempReadInterval, true, function() {
 
 Timer.set(CONFIG.pumpCheckInterval, true, function() {
   evaluatePump();
+  updateScheduleComponent();
 });
 
 Timer.set(CONFIG.ambientReadInterval, true, function() {
@@ -742,6 +867,16 @@ loadKVIP(function(ip) {
     STATE.todayDay   = startInfo.day;
     let modeVC = Shelly.getComponentStatus("enum:" + CONFIG.enumID);
     STATE.currentMode = (modeVC && modeVC.value) ? modeVC.value : "AUTO";
+    let swInit = Shelly.getComponentStatus("switch:" + CONFIG.switchID);
+    if (swInit) {
+      if (swInit.aenergy && swInit.aenergy.total !== undefined) {
+        STATE.energyStartWh = swInit.aenergy.total;
+      }
+      if (swInit.output !== undefined) {
+        STATE.pumpOn = swInit.output === true;
+        if (STATE.pumpOn) STATE.pumpOnSince = Date.now();
+      }
+    }
     STATE.ready      = true;
 
     print("Pronto. Giorno " + startInfo.day + "/" + mStr(startInfo.month) +
@@ -752,6 +887,7 @@ loadKVIP(function(ip) {
     loadScheduleMode(function(loaded) {
       if (loaded) {
         evaluatePump();
+        updateScheduleComponent();
       } else {
         bootstrapTemperature(function() {
           if (STATE.lastTemp !== null) {
@@ -759,6 +895,7 @@ loadKVIP(function(ip) {
             print("Bootstrap mode: " + STATE.activeScheduleMode + " (T=" + STATE.lastTemp + ")");
           }
           evaluatePump();
+          updateScheduleComponent();
         });
       }
     });

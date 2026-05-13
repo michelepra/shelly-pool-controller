@@ -53,29 +53,40 @@ const WEATHER_BODY = JSON.stringify({
   daily:   { temperature_2m_max: [25, 26], wind_speed_10m_max: [12, 14] },
 });
 
+// Restituisce il timestamp Unix per l'ora h del giorno di BASE_UNIXTIME nel fuso locale.
+function unixtimeForHour(h) {
+  const d = new Date(BASE_UNIXTIME * 1000);
+  d.setHours(h, 0, 0, 0);
+  return Math.floor(d.getTime() / 1000);
+}
+
 function createSim(opts) {
   opts = Object.assign({
-    kv:        {},       // chiavi KV precaricate
-    tempC:     29,       // temperatura diretta dal sensore (°C)
-    tempCSeq:  null,     // sequenza di temperature (null = errore per quel tentativo)
-    tempError: false,    // true = HTTP errore su tutti i tentativi
-    internetOk: true,    // false = Open-Meteo non raggiungibile
-    unixtime:  BASE_UNIXTIME,
-    uptime:    200,
-    sw1:       false,
-    pumpMode:  'AUTO',
-    verbose:   false,
+    kv:           {},      // chiavi KV precaricate
+    tempC:        29,      // temperatura diretta dal sensore (°C)
+    tempCSeq:     null,    // sequenza di temperature (null = errore per quel tentativo)
+    tempError:    false,   // true = HTTP errore su tutti i tentativi
+    internetOk:   true,    // false = Open-Meteo non raggiungibile
+    unixtime:     BASE_UNIXTIME,
+    uptime:       200,
+    sw1:          false,
+    pumpMode:     'AUTO',
+    switchOutput: false,   // stato iniziale rele' 0 (output di switch:0)
+    energyTotal:  0,       // aenergy.total rele' 0 in Wh (cumulativo)
+    verbose:      false,
   }, opts);
 
   // pt_lat/pt_lon sempre presenti (richiesti da fetchAmbientTemp); sovrascrivibili via opts.kv
   const kv = Object.assign({ 'pt_lat': POOL_LAT, 'pt_lon': POOL_LON }, opts.kv);
-  const prints      = [];
-  const switchCalls = [];
-  const textCalls   = [];
-  const kvSets      = [];
-  const timers      = [];
-  let   timerSeq    = 0;
-  let   tempIdx     = 0;
+  const prints         = [];
+  const switchCalls    = [];
+  const textCalls      = [];
+  const kvSets         = [];
+  const timers         = [];
+  const statusHandlers = [];
+  let   timerSeq       = 0;
+  let   tempIdx        = 0;
+  let   currentSwitchOutput = opts.switchOutput;
 
   const Timer = {
     set:   (ms, repeat, fn) => { const id = ++timerSeq; timers.push({ id, repeat, fn }); return id; },
@@ -93,6 +104,11 @@ function createSim(opts) {
         kvSets.push({ key: params.key, value: params.value });
         if (cb) cb({}, null);
 
+      } else if (method === 'Enum.Set') {
+        // Aggiorna pumpMode cosi' getComponentStatus('enum:*') riflette il nuovo valore
+        opts.pumpMode = params.value;
+        if (cb) cb({}, null);
+
       } else if (method === 'HTTP.GET') {
         if (params.url.indexOf('open-meteo.com') >= 0) {
           if (opts.internetOk) cb({ code: 200, body: WEATHER_BODY }, null);
@@ -108,6 +124,7 @@ function createSim(opts) {
         } else { if (cb) cb(null, 'unknown'); }
 
       } else if (method === 'Switch.Set') {
+        currentSwitchOutput = params.on;
         switchCalls.push({ on: params.on });
         if (cb) cb({}, null);
 
@@ -117,12 +134,13 @@ function createSim(opts) {
       }
     },
     getComponentStatus: (comp) => {
-      if (comp === 'sys')          return { unixtime: opts.unixtime, uptime: opts.uptime };
-      if (comp === 'input:0')      return { state: opts.sw1 };
-      if (comp.startsWith('enum:'))return { value: opts.pumpMode };
+      if (comp === 'sys')             return { unixtime: opts.unixtime, uptime: opts.uptime };
+      if (comp === 'input:0')         return { state: opts.sw1 };
+      if (comp.startsWith('enum:'))   return { value: opts.pumpMode };
+      if (comp.startsWith('switch:')) return { output: currentSwitchOutput, aenergy: { total: opts.energyTotal } };
       return null;
     },
-    addStatusHandler: () => {},
+    addStatusHandler: (fn) => { statusHandlers.push(fn); },
   };
 
   const print = (msg) => { prints.push(String(msg)); if (opts.verbose) console.log('    LOG:', msg); };
@@ -151,17 +169,28 @@ function createSim(opts) {
   }
   fireOneShots();
 
+  // Simula un evento Shelly (status handler) come farebbe il firmware
+  function fireEvent(event) {
+    statusHandlers.forEach(fn => fn(event));
+    fireOneShots();
+  }
+
   return {
     STATE:   ctx.__STATE,
     CONFIG:  ctx.__CONFIG,
     prints,  switchCalls, textCalls, kvSets, kv, timers,
+    opts,    // esposto per modificare unixtime, pumpMode ecc. tra una chiamata e l'altra
     // funzioni direttamente accessibili (dichiarazioni function)
-    getModeFromTemp:         (t)    => ctx.getModeFromTemp(t),
-    shouldPumpRunBySchedule: (h, t) => ctx.shouldPumpRunBySchedule(h, t),
-    evaluatePump:            ()     => ctx.evaluatePump(),
-    checkDateChange:         ()     => ctx.checkDateChange(),
-    fetchTemperature:        ()     => ctx.fetchTemperature(),
-    getEffectiveTemp:        ()     => ctx.getEffectiveTemp(),
+    getModeFromTemp:         (t)       => ctx.getModeFromTemp(t),
+    shouldPumpRunBySchedule: (h, t)    => ctx.shouldPumpRunBySchedule(h, t),
+    evaluatePump:            ()        => ctx.evaluatePump(),
+    checkDateChange:         ()        => ctx.checkDateChange(),
+    fetchTemperature:        ()        => ctx.fetchTemperature(),
+    getEffectiveTemp:        ()        => ctx.getEffectiveTemp(),
+    updateDailyStats:        (t)       => ctx.updateDailyStats(t),
+    updateScheduleComponent: ()        => ctx.updateScheduleComponent(),
+    setPump:                 (on, src) => ctx.setPump(on, src),
+    fireEvent,
     fireOneShots,
   };
 }
@@ -575,6 +604,314 @@ test('text:201 non scritto senza internet', () => {
   const sim = createSim({ kv: {}, internetOk: false });
   const vc = sim.textCalls.filter(t => t.id === 201);
   eq(vc.length, 0, 'text:201 non scritto senza meteo');
+});
+
+// ─── OVERRIDE MANUALE AUTO ───────────────────────────────────────────────────
+console.log(B + '\nOverride manuale AUTO\n' + X);
+
+test('Override ON fase 0: schedule OFF → pompa rimane ON', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO', unixtime: unixtimeForHour(10) });
+  sim.STATE.activeScheduleMode = 'A1';  // A1: solo 13-14
+  sim.STATE.manualOverride = 'on';
+  sim.STATE.overridePhase  = 0;
+  sim.STATE.pumpOn         = true;
+  sim.STATE.pumpOnSince    = Date.now();
+  sim.evaluatePump();
+  ok(sim.STATE.pumpOn === true,      'pompa rimane ON');
+  eq(sim.STATE.manualOverride, 'on', 'override ancora attivo');
+  eq(sim.STATE.overridePhase,   0,   'fase ancora 0');
+});
+
+test('Override ON: schedule ON → avanza a fase 1', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO', unixtime: unixtimeForHour(13) });
+  sim.STATE.activeScheduleMode = 'A1';
+  sim.STATE.manualOverride = 'on';
+  sim.STATE.overridePhase  = 0;
+  sim.STATE.pumpOn         = true;
+  sim.STATE.pumpOnSince    = Date.now();
+  sim.evaluatePump();
+  ok(sim.STATE.pumpOn === true,      'pompa ON');
+  eq(sim.STATE.manualOverride, 'on', 'override attivo');
+  eq(sim.STATE.overridePhase,   1,   'fase avanzata a 1');
+});
+
+test('Override ON fase 1: schedule OFF → override termina, pompa OFF', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO', unixtime: unixtimeForHour(14) });
+  sim.STATE.activeScheduleMode = 'A1';  // A1: h=14 → fuori fascia
+  sim.STATE.manualOverride = 'on';
+  sim.STATE.overridePhase  = 1;
+  sim.STATE.pumpOn         = true;
+  sim.STATE.pumpOnSince    = Date.now();
+  sim.evaluatePump();
+  ok(sim.STATE.pumpOn === false,        'pompa OFF: override terminato');
+  ok(sim.STATE.manualOverride === null, 'override azzerato');
+  eq(sim.STATE.overridePhase, 0,        'fase azzerata');
+  has(sim.prints, 'Override ON terminato', 'log terminazione');
+});
+
+test('Override OFF fase 0: schedule ON → pompa rimane OFF', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO', unixtime: unixtimeForHour(13) });
+  sim.STATE.activeScheduleMode = 'A1';
+  sim.STATE.manualOverride = 'off';
+  sim.STATE.overridePhase  = 0;
+  sim.STATE.pumpOn         = false;
+  sim.evaluatePump();
+  ok(sim.STATE.pumpOn === false,       'pompa rimane OFF');
+  eq(sim.STATE.manualOverride, 'off',  'override ancora attivo');
+  eq(sim.STATE.overridePhase,   0,     'fase ancora 0');
+});
+
+test('Override OFF: schedule OFF → avanza a fase 1', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO', unixtime: unixtimeForHour(10) });
+  sim.STATE.activeScheduleMode = 'A1';
+  sim.STATE.manualOverride = 'off';
+  sim.STATE.overridePhase  = 0;
+  sim.STATE.pumpOn         = false;
+  sim.evaluatePump();
+  ok(sim.STATE.pumpOn === false,       'pompa OFF');
+  eq(sim.STATE.manualOverride, 'off',  'override attivo');
+  eq(sim.STATE.overridePhase,   1,     'fase avanzata a 1');
+});
+
+test('Override OFF fase 1: schedule ON → override termina, pompa ON', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO', unixtime: unixtimeForHour(13) });
+  sim.STATE.activeScheduleMode = 'A1';  // A1: h=13 → ON
+  sim.STATE.manualOverride = 'off';
+  sim.STATE.overridePhase  = 1;
+  sim.STATE.pumpOn         = false;
+  sim.evaluatePump();
+  ok(sim.STATE.pumpOn === true,          'pompa ON: override terminato');
+  ok(sim.STATE.manualOverride === null,  'override azzerato');
+  eq(sim.STATE.overridePhase, 0,         'fase azzerata');
+  has(sim.prints, 'Override OFF terminato', 'log terminazione');
+});
+
+test('Scenario completo: acceso alle 11 → ON fino alle 13 (A1)', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO' });
+  sim.STATE.activeScheduleMode = 'A1';
+  sim.STATE.manualOverride = 'on';
+  sim.STATE.overridePhase  = 0;
+  sim.STATE.pumpOn         = true;
+  sim.STATE.pumpOnSince    = Date.now();
+  // H=11: fuori fascia, fase 0 → rimane ON
+  sim.opts.unixtime = unixtimeForHour(11);
+  sim.evaluatePump();
+  ok(sim.STATE.pumpOn && sim.STATE.overridePhase === 0, 'H=11: ON fase 0');
+  // H=13: fascia ON → fase 1
+  sim.opts.unixtime = unixtimeForHour(13);
+  sim.evaluatePump();
+  ok(sim.STATE.pumpOn && sim.STATE.overridePhase === 1, 'H=13: ON fase 1');
+  // H=14: fascia OFF → override termina
+  sim.opts.unixtime = unixtimeForHour(14);
+  sim.evaluatePump();
+  ok(!sim.STATE.pumpOn && sim.STATE.manualOverride === null, 'H=14: OFF, override azzerato');
+});
+
+test('Scenario completo: spento alle 12:30 → OFF fino alle 15 (A3)', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO' });
+  sim.STATE.activeScheduleMode = 'A3';  // 9-10, 12-13, 15-16
+  sim.STATE.manualOverride = 'off';
+  sim.STATE.overridePhase  = 0;
+  sim.STATE.pumpOn         = false;
+  // H=12: dentro fascia (schedule ON), fase 0 → rimane OFF
+  sim.opts.unixtime = unixtimeForHour(12);
+  sim.evaluatePump();
+  ok(!sim.STATE.pumpOn && sim.STATE.overridePhase === 0, 'H=12: OFF fase 0');
+  // H=13: fuori fascia (schedule OFF) → fase 1
+  sim.opts.unixtime = unixtimeForHour(13);
+  sim.evaluatePump();
+  ok(!sim.STATE.pumpOn && sim.STATE.overridePhase === 1, 'H=13: OFF fase 1');
+  // H=15: nuova fascia (schedule ON) → override termina, pompa ON
+  sim.opts.unixtime = unixtimeForHour(15);
+  sim.evaluatePump();
+  ok(sim.STATE.pumpOn && sim.STATE.manualOverride === null, 'H=15: ON, override azzerato');
+});
+
+test('Override azzerato su cambio modalita\'', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO' });
+  sim.STATE.manualOverride = 'on';
+  sim.STATE.overridePhase  = 1;
+  sim.opts.pumpMode = 'OFF';
+  sim.fireEvent({ component: 'enum:200', delta: { value: 'OFF' } });
+  ok(sim.STATE.manualOverride === null, 'override azzerato su cambio modo');
+  eq(sim.STATE.overridePhase, 0,       'fase azzerata');
+});
+
+test('Override azzerato su cambio giorno', () => {
+  const sim = createSim({ kv: {} });
+  sim.STATE.manualOverride = 'off';
+  sim.STATE.overridePhase  = 1;
+  sim.STATE.todayDay   = -1;
+  sim.STATE.todayMonth = -1;
+  sim.checkDateChange();
+  ok(sim.STATE.manualOverride === null, 'override azzerato su cambio giorno');
+  eq(sim.STATE.overridePhase, 0,       'fase azzerata');
+});
+
+test('SW1 prioritario su override OFF: pompa ON', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO' });
+  sim.STATE.manualOverride = 'off';
+  sim.STATE.pumpOn         = false;
+  sim.STATE.hwActive       = true;
+  sim.STATE.extForcedOff   = false;
+  sim.evaluatePump();
+  ok(sim.STATE.pumpOn === true,   'pompa ON nonostante override OFF');
+  has(sim.prints, 'hardware SW1', 'sorgente SW1');
+});
+
+test('SW1 attivo: rele\' spento esternamente → ripristinato immediatamente', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO', internetOk: false, unixtime: unixtimeForHour(7) });
+  sim.STATE.hwActive     = true;
+  sim.STATE.extForcedOff = false;
+  sim.evaluatePump();  // hwActive → pumpOn = true
+  ok(sim.STATE.pumpOn === true, 'prerequisito: pompa ON per SW1');
+  // Evento esterno: rele' spento dall'app
+  sim.fireEvent({ component: 'switch:0', delta: { output: false } });
+  // handler: mismatch → aggiorna state, hwActive=true → evaluatePump → ripristina ON
+  ok(sim.STATE.pumpOn === true, 'SW1 ripristina pompa ON immediatamente');
+});
+
+test('Evento switch:0 esterno imposta override ON in AUTO', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO', internetOk: false, unixtime: unixtimeForHour(7) });
+  sim.STATE.pumpOn      = false;
+  sim.STATE.pumpOnSince = 0;
+  sim.STATE.currentMode = 'AUTO';
+  sim.fireEvent({ component: 'switch:0', delta: { output: true } });
+  eq(sim.STATE.manualOverride, 'on', 'override ON impostato');
+  ok(sim.STATE.pumpOn === true,      'STATE.pumpOn sincronizzato');
+  ok(sim.STATE.pumpOnSince > 0,      'pumpOnSince registrato');
+});
+
+test('Evento switch:0 esterno imposta override OFF in AUTO', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO', internetOk: false, unixtime: unixtimeForHour(7) });
+  sim.STATE.pumpOn      = true;
+  sim.STATE.pumpOnSince = Date.now() - 5000;
+  sim.STATE.currentMode = 'AUTO';
+  sim.fireEvent({ component: 'switch:0', delta: { output: false } });
+  eq(sim.STATE.manualOverride, 'off', 'override OFF impostato');
+  ok(sim.STATE.pumpOn === false,      'STATE.pumpOn sincronizzato');
+  ok(sim.STATE.pumpTodayMs >= 5000,   'pumpTodayMs accumulato');
+});
+
+test('Evento switch:0 non imposta override fuori da modalita\' AUTO', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'ON' });
+  sim.STATE.currentMode = 'ON';
+  sim.STATE.pumpOn      = false;
+  sim.fireEvent({ component: 'switch:0', delta: { output: true } });
+  ok(sim.STATE.manualOverride === null, 'override non impostato in modo ON');
+});
+
+test('Evento switch:0 ignorato se gia\' coerente con STATE.pumpOn', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'AUTO' });
+  const overridesBefore = sim.STATE.manualOverride;
+  sim.fireEvent({ component: 'switch:0', delta: { output: sim.STATE.pumpOn } });
+  eq(sim.STATE.manualOverride, overridesBefore, 'nessun cambio override su evento coerente');
+});
+
+// ─── CONTATORI RUNTIME POMPA ──────────────────────────────────────────────────
+console.log(B + '\nContatori runtime pompa\n' + X);
+
+test('pumpTodayMs: accumula ms quando pompa si spegne via setPump', () => {
+  const sim = createSim({ kv: {}, pumpMode: 'OFF' });
+  sim.STATE.pumpOn      = true;
+  sim.STATE.pumpOnSince = Date.now() - 5000;
+  const before = sim.STATE.pumpTodayMs;
+  sim.evaluatePump();  // modo OFF → chiude sessione
+  ok(sim.STATE.pumpTodayMs > before, 'pumpTodayMs incrementato');
+  ok(sim.STATE.pumpTodayMs >= 5000,  'almeno 5 secondi accumulati');
+  eq(sim.STATE.pumpOnSince, 0,       'pumpOnSince azzerato');
+});
+
+test('pumpTodayMs: azzerato su cambio giorno', () => {
+  const sim = createSim({ kv: {} });
+  sim.STATE.pumpTodayMs = 999999;
+  sim.STATE.todayDay    = -1;
+  sim.STATE.todayMonth  = -1;
+  sim.checkDateChange();
+  eq(sim.STATE.pumpTodayMs, 0, 'pumpTodayMs azzerato a mezzanotte');
+});
+
+test('max/min NON aggiornati se pompa accesa da meno di 60s', () => {
+  const sim = createSim({ kv: {} });
+  sim.STATE.pumpOn       = true;
+  sim.STATE.pumpOnSince  = Date.now() - 30000;  // 30s, troppo poco
+  sim.STATE.todayMaxTemp = 20;
+  sim.STATE.todayMinTemp = 20;
+  sim.updateDailyStats(35);
+  eq(sim.STATE.todayMaxTemp, 20, 'max invariato prima del minuto');
+  eq(sim.STATE.todayMinTemp, 20, 'min invariato prima del minuto');
+});
+
+test('max/min aggiornati se pompa accesa da piu\' di 60s', () => {
+  const sim = createSim({ kv: {} });
+  sim.STATE.pumpOn       = true;
+  sim.STATE.pumpOnSince  = Date.now() - 90000;  // 90s, oltre 1 minuto
+  sim.STATE.todayMaxTemp = 20;
+  sim.updateDailyStats(35);
+  ok(sim.STATE.todayMaxTemp > 20, 'max aggiornato: ' + sim.STATE.todayMaxTemp);
+});
+
+test('max/min NON aggiornati se pompa spenta', () => {
+  const sim = createSim({ kv: {} });
+  sim.STATE.pumpOn       = false;
+  sim.STATE.pumpOnSince  = 0;
+  sim.STATE.todayMaxTemp = 20;
+  sim.updateDailyStats(35);
+  eq(sim.STATE.todayMaxTemp, 20, 'max invariato con pompa spenta');
+});
+
+// ─── VIRTUAL COMPONENT text:203 ──────────────────────────────────────────────
+console.log(B + '\ntext:203 (fascia oraria + runtime + kWh)\n' + X);
+
+test('text:203: formato corretto con runtime, kWh e ore minime (A9)', () => {
+  const sim = createSim({ kv: {}, energyTotal: 0 });
+  sim.STATE.activeScheduleMode = 'A9';
+  sim.STATE.pumpTodayMs        = (3 * 3600 + 45 * 60) * 1000;  // 3h45m
+  sim.STATE.pumpOn             = false;
+  sim.STATE.energyStartWh      = 0;
+  sim.updateScheduleComponent();
+  const vc  = sim.textCalls.filter(t => t.id === 203);
+  ok(vc.length > 0, 'text:203 scritto');
+  const val = vc[vc.length - 1].value;
+  has([val], '3h45m', 'runtime corretto: ' + val);
+  has([val], 'Kwh',   'kWh presente: ' + val);
+  has([val], '9h',    'ore minime A9: ' + val);
+});
+
+test('text:203: energia giornaliera calcolata da delta Wh', () => {
+  const sim = createSim({ kv: {}, energyTotal: 1500 });
+  sim.STATE.energyStartWh      = 1000;  // 500 Wh consumati oggi = 0.5 kWh
+  sim.STATE.pumpTodayMs        = 0;
+  sim.STATE.pumpOn             = false;
+  sim.STATE.activeScheduleMode = null;
+  sim.updateScheduleComponent();
+  const vc  = sim.textCalls.filter(t => t.id === 203);
+  const val = vc[vc.length - 1].value;
+  has([val], '0.5 Kwh', 'energia 0.5 kWh: ' + val);
+});
+
+test('text:203: runtime include sessione corrente se pompa accesa', () => {
+  const sim = createSim({ kv: {}, energyTotal: 0 });
+  sim.STATE.pumpTodayMs        = 0;
+  sim.STATE.pumpOn             = true;
+  sim.STATE.pumpOnSince        = Date.now() - 7200000;  // 2 ore fa
+  sim.STATE.activeScheduleMode = 'A6';
+  sim.updateScheduleComponent();
+  const vc  = sim.textCalls.filter(t => t.id === 203);
+  const val = vc[vc.length - 1].value;
+  ok(val.startsWith('2h'), 'runtime almeno 2h: ' + val);
+  has([val], '6h', 'ore minime A6: ' + val);
+});
+
+test('text:203: ore minime -- se modalita\' non ancora determinata', () => {
+  const sim = createSim({ kv: {}, energyTotal: 0 });
+  sim.STATE.pumpTodayMs        = 0;
+  sim.STATE.pumpOn             = false;
+  sim.STATE.activeScheduleMode = null;
+  sim.updateScheduleComponent();
+  const vc  = sim.textCalls.filter(t => t.id === 203);
+  const val = vc[vc.length - 1].value;
+  ok(val.endsWith('--'), 'ore minime -- senza modo: ' + val);
 });
 
 // ─── RIEPILOGO ────────────────────────────────────────────────────────────────
