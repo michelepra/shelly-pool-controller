@@ -1,0 +1,3 @@
+[submodule "pool-controller-client"]
+	path = pool-controller-client
+	url = https://github.com/michelepra/pool-controller
