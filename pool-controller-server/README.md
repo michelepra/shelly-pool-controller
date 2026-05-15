@@ -119,6 +119,7 @@ Dall'interfaccia web del Pro 2PM → **Virtual Components**:
 | 200 | Text | Temperatura Acqua | Sola lettura, aggiornato dallo script |
 | 201 | Text | Meteo Attuale | Sola lettura, aggiornato ogni 15 min |
 | 202 | Text | Previsioni Domani | Sola lettura, aggiornato ogni 15 min |
+| 203 | Text | Fascia Oraria | Sola lettura: runtime pompa oggi, energia kWh, ore target fascia |
 
 > **Nota firmware ≥ 1.7.5**: gli ID sono per-tipo — `enum:200`, `number:200` e `text:200` coesistono senza conflitti.
 
@@ -216,10 +217,11 @@ La fascia oraria applicata è determinata dalla **media giornaliera** della temp
 Quando il sensore non è disponibile la temperatura viene stimata con:
 
 ```
-T_acqua = T_aria_smorzata × waterTempFactor + waterTempOffset
+T_acqua = T_max_prevista_oggi × waterTempFactor + waterTempOffset
 ```
 
-- `T_aria_smorzata`: EMA della temperatura ambientale (costante di tempo ~8h, simula inerzia termica)
+- `T_max_prevista_oggi`: temperatura massima giornaliera prevista da Open-Meteo (`daily.temperature_2m_max[0]`)
+- La temperatura ambientale EMA (costante ~8h) viene tenuta in parallelo ma non entra direttamente nella formula
 - Correzione evaporativa tramite formula ASHRAE in base a umidità e vento
 - Calibrazione automatica: ogni notte confronta il massimo misurato con la stima e aggiusta l'offset (±8°C max, salvato in `pt_cal`)
 
@@ -233,19 +235,21 @@ Lo script sul Plus 2PM ascolta gli eventi di cambio valore della sonda digitale 
 
 ## KV Store
 
-Lo script usa fino a 7 chiavi KV (limite dispositivo: 50 chiavi).
+Lo script usa fino a 9 chiavi KV (limite dispositivo: 50 chiavi).
 
 | Dispositivo | Chiave | Contenuto | Obbligatoria | Esempio |
 |-------------|--------|-----------|:---:|---------|
-| Pro 2PM | `pt_ip` | IP del Plus 2PM | ✓ | `192.168.1.100` |
+| Pro 2PM | `pt_ip` | IP del Plus 2PM | — | `192.168.1.100` |
 | Pro 2PM | `pt_lat` | Latitudine posizione | ✓ | `00.00` |
 | Pro 2PM | `pt_lon` | Longitudine posizione | ✓ | `00.00` |
 | Pro 2PM | `ext_off` | Blocco EXTERNAL da app | — | `1` (attivo) / `0` |
 | Pro 2PM | `pt_cal` | Offset calibrazione stima temperatura | — | `1.2` |
 | Pro 2PM | `pt_mode` | Fascia oraria corrente + timestamp | — | `A9:1748000000` |
+| Pro 2PM | `pt_hourly` | Medie orarie temperatura odierna (JSON array 24 slot) | — | `[0,0,...,28.3,28.7,0,...]` |
+| Pro 2PM | `pt_day` | Giorno di riferimento di `pt_hourly` ("DD/MM") | — | `15/05` |
 | Plus 2PM | `pro_ip` | IP del Pro 2PM | ✓ | `192.168.1.101` |
 
-> Le chiavi `ext_off`, `pt_cal` e `pt_mode` sono gestite automaticamente dallo script e non richiedono impostazione manuale.
+> Le chiavi `ext_off`, `pt_cal`, `pt_mode`, `pt_hourly` e `pt_day` sono gestite automaticamente dallo script e non richiedono impostazione manuale. `pt_ip` è facoltativo: senza di esso lo script funziona ma non può leggere la temperatura via HTTP diretto (si affida agli eventi da `sonda_temperatura.js`).
 
 ---
 
@@ -314,6 +318,20 @@ A: 28 U:-- V:22 TS: 26.1
 | `V` | Velocità vento massima prevista (km/h) |
 | `TS` | Temperatura acqua stimata per domani |
 
+### text:203 — Fascia Oraria
+
+Aggiornato ogni 60 secondi con il consuntivo della giornata in corso:
+
+```
+3h25m | 1.2 Kwh | 9h
+```
+
+| Campo | Descrizione |
+|-------|-------------|
+| `Xh YYm` | Tempo totale di funzionamento pompa oggi (sessioni completate + sessione in corso) |
+| `Z.Z Kwh` | Energia consumata oggi dal relè 0 (delta dal PM integrato); `--` se dato non disponibile |
+| `Wh` | Ore target della fascia oraria attiva (es. `9h` per A9); `--` se non ancora determinata |
+
 ---
 
 ## Installazione
@@ -328,7 +346,7 @@ A: 28 U:-- V:22 TS: 26.1
 
 ```
 1. Pro 2PM — SW1 → modalità Detached
-2. Pro 2PM — Creare Virtual Components: enum:200, number:200, text:200, text:201, text:202
+2. Pro 2PM — Creare Virtual Components: enum:200, number:200, text:200, text:201, text:202, text:203
 3. Pro 2PM — KV Store: pt_ip = <IP Plus 2PM>
                pt_lat = <latitudine>
                pt_lon = <longitudine>
@@ -365,6 +383,9 @@ curl "http://<IP-PLUS-2PM>/rpc/Script.GetStatus?id=1"
 ### Leggere i valori KV via API
 
 ```bash
+# IP Plus 2PM configurato
+curl "http://<IP-PRO-2PM>/rpc/KVS.Get?key=pt_ip"
+
 # Coordinate configurate
 curl "http://<IP-PRO-2PM>/rpc/KVS.Get?key=pt_lat"
 curl "http://<IP-PRO-2PM>/rpc/KVS.Get?key=pt_lon"
@@ -372,12 +393,22 @@ curl "http://<IP-PRO-2PM>/rpc/KVS.Get?key=pt_lon"
 # Offset calibrazione
 curl "http://<IP-PRO-2PM>/rpc/KVS.Get?key=pt_cal"
 
-# Fascia oraria corrente
+# Fascia oraria corrente (scade dopo 24h)
 curl "http://<IP-PRO-2PM>/rpc/KVS.Get?key=pt_mode"
 
 # Stato blocco EXTERNAL
 curl "http://<IP-PRO-2PM>/rpc/KVS.Get?key=ext_off"
+
+# Storico orario odierno (array 24 slot)
+curl "http://<IP-PRO-2PM>/rpc/KVS.Get?key=pt_hourly"
+curl "http://<IP-PRO-2PM>/rpc/KVS.Get?key=pt_day"
 ```
+
+### Storico temperature orarie
+
+Lo script mantiene in `pt_hourly` un array JSON di 24 elementi (indice = ora, 0 = nessun dato per quell'ora) con la media delle temperature rilevate ora per ora. Il campo `pt_day` contiene il giorno di riferimento nel formato `"DD/MM"`.
+
+Questi dati vengono resettati automaticamente a mezzanotte e ripristinati dalla KV in caso di riavvio del dispositivo. L'app Flutter legge entrambi i valori e, se `pt_day` corrisponde alla data odierna, mostra un grafico con l'andamento della temperatura nelle ore già completate.
 
 ### Resettare il blocco EXTERNAL manualmente
 

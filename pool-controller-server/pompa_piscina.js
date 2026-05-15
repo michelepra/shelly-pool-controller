@@ -67,6 +67,8 @@ let CONFIG = {
   poolCoverEvapFactor: 0.1,       // frazione di evaporazione con telo isotermico (~90% riduzione)
   calibAlpha: 0.1,                // velocita' apprendimento calibrazione (10% per giorno)
   ambientReadInterval: 900000,    // lettura temperatura ambientale ogni 15 min (ms)
+  kvHourlyKey: "pt_hourly",       // chiave KV medie orarie giornaliere (array 24 slot)
+  kvDayKey: "pt_day",             // chiave KV giorno di riferimento medie orarie ("DD/MM")
 };
 
 // Numero di letture in 15 minuti; aggiornare se si cambia tempReadInterval
@@ -106,6 +108,10 @@ let STATE = {
   hourBufLen: 0,              // elementi effettivamente presenti (0..hourAvgLen)
   hourBufSum: 0,              // somma corrente del buffer (aggiornamento O(1))
   readingInProgress: false,   // true durante multiReadTemp, blocca il timer
+  todayHour: -1,              // ora corrente per rilevare cambio d'ora (0-23, -1=non inizializzato)
+  currentHourSum: 0,          // somma temperature nell'ora in corso
+  currentHourCount: 0,        // letture nell'ora in corso
+  hourlyAvgs: [],             // medie orarie del giorno: 24 slot, indice=ora, 0=dato non disponibile
   pumpOn: false,
   pumpOnSince: 0,             // timestamp (ms) accensione pompa; 0 se spenta
   pumpTodayMs: 0,             // ms totali di funzionamento pompa oggi (sessioni completate)
@@ -116,6 +122,9 @@ let STATE = {
   antifreezeTimer: null,
   ready: false,
 };
+
+// Inizializza il buffer a 24 slot a zero (0 = dato non disponibile)
+for (let _i = 0; _i < 24; _i++) STATE.hourlyAvgs.push(0);
 
 // ─── UTILITA' TEMPO ───────────────────────────────────────────────────────────
 
@@ -363,6 +372,71 @@ function loadScheduleMode(onComplete) {
   });
 }
 
+// ─── MEDIE ORARIE GIORNALIERE ────────────────────────────────────────────────
+
+function saveHourlyData() {
+  let d = getDateInfo(getUnixtime());
+  let day = d.day;
+  let mon = d.month;
+  let dayStr = (day < 10 ? "0" : "") + day + "/" + mStr(mon);
+  Shelly.call("KVS.Set", { key: CONFIG.kvDayKey, value: dayStr }, function(r, e) {
+    if (e) print("KV day: errore - " + e);
+  });
+  Shelly.call("KVS.Set", { key: CONFIG.kvHourlyKey, value: JSON.stringify(STATE.hourlyAvgs) }, function(r, e) {
+    if (e) print("KV orarie: errore - " + e);
+  });
+}
+
+function loadHourlyData(onComplete) {
+  Shelly.call("KVS.Get", { key: CONFIG.kvDayKey }, function(rDay, eDay) {
+    let d = getDateInfo(getUnixtime());
+    let today = (d.day < 10 ? "0" : "") + d.day + "/" + mStr(d.month);
+    let dayMatch = !eDay && rDay && rDay.value === today;
+    if (!dayMatch) {
+      print("Orarie: giorno diverso, buffer azzerato");
+      if (onComplete) onComplete();
+      return;
+    }
+    Shelly.call("KVS.Get", { key: CONFIG.kvHourlyKey }, function(rH, eH) {
+      if (!eH && rH && rH.value) {
+        try {
+          let arr = JSON.parse(rH.value);
+          if (arr && arr.length === 24) {
+            let count = 0;
+            for (let i = 0; i < 24; i++) {
+              let v = arr[i];
+              STATE.hourlyAvgs[i] = (typeof v === "number") ? v : 0;
+              if (STATE.hourlyAvgs[i] > 0) count++;
+            }
+            print("Orarie: caricate " + count + " ore da KV");
+          }
+        } catch(e) { print("Orarie: errore parsing - " + e); }
+      }
+      if (onComplete) onComplete();
+    });
+  });
+}
+
+function checkHourChange() {
+  let d = getDateInfo(getUnixtime());
+  let hour = d.hour;
+  if (STATE.todayHour === -1) {
+    STATE.todayHour = hour;
+    return;
+  }
+  if (hour === STATE.todayHour) return;
+  // Ora cambiata: registra la media dell'ora appena completata
+  if (STATE.currentHourCount > 0) {
+    let avg = Math.round(STATE.currentHourSum / STATE.currentHourCount * 10) / 10;
+    STATE.hourlyAvgs[STATE.todayHour] = avg;
+    print("Oraria H" + STATE.todayHour + ": " + avg + "C (" + STATE.currentHourCount + " let.)");
+    saveHourlyData();
+  }
+  STATE.todayHour = hour;
+  STATE.currentHourSum = 0;
+  STATE.currentHourCount = 0;
+}
+
 // ─── LETTURA TEMPERATURA AMBIENTALE ──────────────────────────────────────────
 
 function fetchAmbientTemp() {
@@ -467,6 +541,10 @@ function checkDateChange() {
   STATE.pumpTodayMs     = 0;
   STATE.manualOverride  = null;
   STATE.overridePhase   = 0;
+  for (let i = 0; i < 24; i++) STATE.hourlyAvgs[i] = 0;
+  STATE.todayHour       = -1;
+  STATE.currentHourSum  = 0;
+  STATE.currentHourCount = 0;
   // Se la pompa e' accesa a cavallo della mezzanotte, azzera il riferimento
   // cosi' l'accumulatore riparte da zero per il nuovo giorno
   if (STATE.pumpOn) STATE.pumpOnSince = Date.now();
@@ -490,6 +568,8 @@ function updateDailyStats(temp) {
   STATE.todayCurrentTemp = temp;
   STATE.dailyTempSum += temp;
   STATE.dailyTempCount++;
+  STATE.currentHourSum += temp;
+  STATE.currentHourCount++;
 
   // Aggiorna buffer circolare (index-based, niente push/shift)
   let maxLen = CONFIG.hourAvgLen;
@@ -842,6 +922,7 @@ Timer.set(CONFIG.tempReadInterval, true, function() {
     fetchTemperature();
   }
   checkDateChange();
+  checkHourChange();
 });
 
 Timer.set(CONFIG.pumpCheckInterval, true, function() {
@@ -877,6 +958,7 @@ loadKVIP(function(ip) {
         if (STATE.pumpOn) STATE.pumpOnSince = Date.now();
       }
     }
+    loadHourlyData(function() {
     STATE.ready      = true;
 
     print("Pronto. Giorno " + startInfo.day + "/" + mStr(startInfo.month) +
@@ -899,7 +981,8 @@ loadKVIP(function(ip) {
         });
       }
     });
-  });
-  });
-  });
-});
+    }); // loadHourlyData
+  });   // loadKVCoords
+  });   // loadCalibration
+  });   // loadExtForcedOff
+});     // loadKVIP

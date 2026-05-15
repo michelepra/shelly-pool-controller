@@ -61,12 +61,14 @@ Modalità AUTO      →  fasce orarie + temperatura
 ## KV Store (6 chiavi su 50 disponibili)
 
 ```
-pt_ip     →  IP del Plus 2PM (stringa, es. "192.168.1.100")          [obbligatorio]
-pt_lat    →  Latitudine della posizione (float stringa, es. "00.00")  [obbligatorio]
-pt_lon    →  Longitudine della posizione (float stringa, es. "00.00") [obbligatorio]
-ext_off   →  "1" se EXTERNAL mode è bloccata da app, "0" altrimenti (persiste tra riavvii)
-pt_cal    →  calibOffset appreso (float stringa, es. "-1.2") — aggiornato ogni notte
-pt_mode   →  modo fascia oraria attivo + timestamp Unix (es. "A9:1746969600") — scade dopo 24h
+pt_ip      →  IP del Plus 2PM (stringa, es. "192.168.1.100")          [obbligatorio]
+pt_lat     →  Latitudine della posizione (float stringa, es. "00.00")  [obbligatorio]
+pt_lon     →  Longitudine della posizione (float stringa, es. "00.00") [obbligatorio]
+ext_off    →  "1" se EXTERNAL mode è bloccata da app, "0" altrimenti (persiste tra riavvii)
+pt_cal     →  calibOffset appreso (float stringa, es. "-1.2") — aggiornato ogni notte
+pt_mode    →  modo fascia oraria attivo + timestamp Unix (es. "A9:1746969600") — scade dopo 24h
+pt_hourly  →  JSON array 24 slot (indice=ora, 0=nessun dato), medie orarie temperatura odierna — resettato a mezzanotte
+pt_day     →  giorno di riferimento di pt_hourly ("DD/MM") — usato dal client per verificare freschezza dei dati
 ```
 
 Le chiavi pt_01..pt_12 (temperature mensili storiche) sono state rimosse nella versione corrente. Se presenti nel dispositivo da versioni precedenti, possono essere eliminate manualmente ma non interferiscono.
@@ -164,6 +166,9 @@ Stato runtime. Campi chiave:
 - `activeScheduleMode` — modo fascia oraria attivo: "A1","A3","A6","A9","A13"; persiste su KV `pt_mode`
 - `hourBuf` / `hourBufSum` / `hourBufLen` — buffer circolare ultime ~30 letture (media oraria scorrevole)
 - `readingInProgress` — flag per evitare fetch concorrenti
+- `todayHour` — ora corrente (-1=non inizializzata), usata per rilevare il cambio d'ora
+- `currentHourSum` / `currentHourCount` — accumulatore per la media dell'ora corrente
+- `hourlyAvgs` — array 24 slot (indice=ora, 0=nessun dato), medie orarie della giornata odierna; persiste su KV `pt_hourly`
 
 ---
 
@@ -196,6 +201,9 @@ Stato runtime. Campi chiave:
 | `saveCalibration()` | Salva calibOffset su KV (`pt_cal`) |
 | `loadScheduleMode(cb)` | Carica modo fascia oraria da KV (`pt_mode`), scadenza 24h |
 | `saveScheduleMode(mode)` | Salva modo + timestamp su KV (`pt_mode`) |
+| `checkHourChange()` | Rileva cambio d'ora, salva media ora completata in `STATE.hourlyAvgs`, chiama `saveHourlyData()` |
+| `saveHourlyData()` | Salva `pt_day` ("DD/MM") e `pt_hourly` (JSON array 24 slot) su KV |
+| `loadHourlyData(cb)` | All'avvio: legge `pt_day` e, se corrisponde a oggi, ripristina `STATE.hourlyAvgs` da `pt_hourly` |
 
 ---
 

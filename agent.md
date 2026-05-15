@@ -83,12 +83,14 @@ Lo script gira su **Shelly Pro 2PM**, un relè intelligente con scripting mJS em
 ### KV Store (persistenza tra riavvii)
 
 ```
-pt_ip     →  IP Shelly Plus 2PM                        [obbligatorio]
-pt_lat    →  latitudine (float stringa)                 [obbligatorio per meteo]
-pt_lon    →  longitudine (float stringa)                [obbligatorio per meteo]
-ext_off   →  "1" se EXTERNAL forzato OFF dall'app
-pt_cal    →  calibOffset appreso (float stringa)
-pt_mode   →  modo fascia oraria + timestamp Unix ("A9:1746969600"), scade 24h
+pt_ip      →  IP Shelly Plus 2PM                        [obbligatorio]
+pt_lat     →  latitudine (float stringa)                 [obbligatorio per meteo]
+pt_lon     →  longitudine (float stringa)                [obbligatorio per meteo]
+ext_off    →  "1" se EXTERNAL forzato OFF dall'app
+pt_cal     →  calibOffset appreso (float stringa)
+pt_mode    →  modo fascia oraria + timestamp Unix ("A9:1746969600"), scade 24h
+pt_hourly  →  JSON array 24 slot (indice=ora, 0=dato non disponibile), medie orarie temperatura odierna
+pt_day     →  giorno di riferimento di pt_hourly ("DD/MM"), resettato a mezzanotte
 ```
 
 ### Virtual Components (Pro 2PM, firmware >= 1.7.5)
@@ -210,16 +212,29 @@ GET  /api/weather                 →  WeatherData JSON
 
 ### Mappatura Shelly → app
 
-| Shelly component | Funzione |
-|-----------------|----------|
+**Shelly Pro 2PM**
+
+| Component | Funzione |
+|-----------|----------|
 | switch:0 | Pompa filtrazione |
 | switch:1 | Luci piscina |
-| switch:2 | Impianto audio |
-| switch:3 | Luce esterna |
 | input:0 (SW1) | Segnale pdc/tControl |
 | input:1 (SW2) | Segnale luci tControl |
-| temperature:100 | Temperatura acqua (Plus 2PM) |
-| temperature:101/102 | Temp locale / ambiente |
+| enum:200 | Modalità pompa |
+| text:200 | Temperatura acqua + min/max odierni |
+| KVS pt_hourly | Array 24 slot medie orarie temperatura |
+| KVS pt_day | Giorno di riferimento ("DD/MM") |
+
+**Shelly Plus 2PM**
+
+| Component | Funzione |
+|-----------|----------|
+| switch:0 | Luce esterna |
+| switch:1 | Impianto audio |
+| input:0 | Switch fisico luce esterna |
+| input:1 | Switch fisico audio |
+| temperature:101 | Temperatura locale tecnico |
+| temperature:102 | Temperatura ambiente |
 
 ### Dipendenze principali
 
@@ -236,7 +251,7 @@ intl: ^0.19.0
 
 ### Dashboard widgets
 
-1. **TemperatureCard** — temperatura acqua + grafico 7 giorni
+1. **TemperatureCard** — temperatura acqua + grafico andamento orario odierno (da `pt_hourly`/`pt_day` del KV store Pro 2PM); se il giorno non corrisponde mostra solo temperatura corrente
 2. **PumpCard** — stato pompa + indicatore SW1
 3. **ModeCard** — AUTO/EXTERNAL + fascia oraria attiva
 4. **LightsCard** — luci + indicatore SW2
